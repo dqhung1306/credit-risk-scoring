@@ -1,0 +1,19 @@
+# Dữ liệu
+data/
+*.csv
+*.xlsx
+
+# Mô hình đã huấn luyện
+models/*.pkl
+models/*.joblib
+
+# Môi trường ảo
+venv/
+__pycache__/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Hệ thống
+.DS_Store
+Thumbs.db
