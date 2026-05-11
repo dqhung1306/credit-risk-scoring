@@ -3,14 +3,22 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
+import sys
 import shap
 import requests
 import matplotlib.pyplot as plt
 import warnings
-from utils import DataPreprocessor
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
+
+# Patch sys.modules TRƯỚC KHI load pkl
+# joblib unpickle tìm class theo module path lúc pickle.
+# Pkl cũ có thể pickle từ __main__ hoặc utils, patch cả hai.
+from utils import DataPreprocessor
+import utils as _utils_module
+sys.modules['__main__'].DataPreprocessor = DataPreprocessor
+sys.modules['utils'] = _utils_module
 
 # ==================== API CONFIG ====================
 # Đổi URL này nếu deploy API lên server khác (VD: http://192.168.1.10:8000)
@@ -172,18 +180,26 @@ from utils import DataPreprocessor  # Import trực tiếp class từ utils
 
 @st.cache_resource
 def load_assets():
-    """Load preprocessor từ utils và chuẩn bị model fallback"""
+    """Load processor từ pkl, fallback tạo mới nếu load thất bại"""
     current_dir = os.path.dirname(os.path.abspath(__file__))
+    processor_path = os.path.join(current_dir, '..', 'models', 'data_preprocessor.pkl')
 
-    try:
-        # Dùng is_training=True để datapreprocessing() tự build schema cột
-        # từ data người dùng upload, không cần train_features từ pkl.
-        # Việc align cột với model (reindex theo FEATURES) được xử lý bởi api.py,
-        # nên main.py không cần biết schema training.
+    processor = None
+
+    # Thử load pkl — sys.modules đã được patch ở trên nên unpickle sẽ tìm đúng class
+    if os.path.exists(processor_path):
+        try:
+            processor = joblib.load(processor_path)
+            processor.is_training = False
+            print(f"✅ Processor loaded từ pkl, train_features: {len(processor.train_features) if processor.train_features else 'None'}")
+        except Exception as e:
+            st.warning(f"⚠️ Không load được processor.pkl ({e}) — dùng processor mới với is_training=True")
+            processor = None
+
+    if processor is None:
+        # Fallback: processor mới, chạy is_training=True
+        # api.py sẽ reindex cột về FEATURES model nên vẫn predict đúng
         processor = DataPreprocessor(is_training=True)
-    except Exception as e:
-        st.error(f"❌ Lỗi khởi tạo preprocessor: {e}")
-        st.stop()
 
     # Nếu API không khả dụng → fallback load model local
     if not api_is_available():  # Giả sử hàm này đã được định nghĩa ở đâu đó

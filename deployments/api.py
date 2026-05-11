@@ -1,32 +1,6 @@
 """
 api.py — FastAPI server cho Credit Risk Model
-----------------------------------------------
-Chạy server:
-    uvicorn api:app --host 0.0.0.0 --port 8000 --reload
-
-Các endpoint:
-    GET  /health            → kiểm tra server còn sống không
-    POST /predict           → dự đoán xác suất rủi ro cho batch khách hàng
-    POST /predict/single    → dự đoán cho 1 khách hàng (dict)
-    POST /shap              → trả về SHAP values cho 1 khách hàng
-    GET  /features          → danh sách features mô hình đang dùng
-
-BUG FIXES:
-    [BUG 1] records_to_df() dùng sai thứ tự ưu tiên features:
-            - Trước: luôn dùng FEATURES của model, bỏ qua features trong request
-            - Fix: dùng features từ request (đã được main.py gửi đúng sau preprocessing)
-
-    [BUG 2] records_to_df() không align cột đúng với model:
-            - Trước: fillna(0) rồi mới select → nếu cột thiếu thì điền 0 trước khi reindex
-            - Fix: reindex theo đúng FEATURES của model SAU khi build DataFrame,
-              đảm bảo thứ tự cột khớp chính xác với lúc train
-
-    [BUG 3] FEATURES lấy từ model nhưng không validate với processor.train_features:
-            - Trước: FEATURES = model.feature_name_ nhưng processor.train_features
-              (sau re.sub rename) có thể khác tên
-            - Fix: ưu tiên dùng processor.train_features nếu có, fallback về model
 """
-
 import os
 import sys
 import joblib
@@ -45,9 +19,6 @@ from utils import DataPreprocessor
 
 warnings.filterwarnings("ignore")
 
-# Không cần sys.modules workaround nữa: vì DataPreprocessor được import trực tiếp
-# từ utils.py, joblib.load(processor_path) sẽ tìm đúng class này khi unpickle.
-# Dòng dưới được giữ lại phòng trường hợp pkl cũ được pickle với __main__.DataPreprocessor.
 import sys
 sys.modules.setdefault('__main__', sys.modules[__name__])
 sys.modules['__main__'].DataPreprocessor = DataPreprocessor
@@ -80,11 +51,7 @@ try:
 except Exception as e:
     raise RuntimeError(f"❌ Không thể load model: {e}")
 
-# ==================== LẤY FEATURES ====================
-# [FIX BUG 3] Ưu tiên train_features từ processor vì đây là danh sách cột
-# đã qua re.sub rename trong datapreprocessing() → đảm bảo tên cột khớp 100%
-# với dữ liệu mà main.py gửi lên. Fallback về model.feature_name_ nếu processor
-# chưa được fit (train_features = None).
+
 try:
     if processor.train_features is not None:
         FEATURES = [c for c in processor.train_features if c not in ('TARGET', 'SK_ID_CURR')]
