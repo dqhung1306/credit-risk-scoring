@@ -4,12 +4,25 @@ import numpy as np
 import joblib
 import os
 import shap
+import requests
 import matplotlib.pyplot as plt
 import warnings
 from utils import DataPreprocessor
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
+
+# ==================== API CONFIG ====================
+# Đổi URL này nếu deploy API lên server khác (VD: http://192.168.1.10:8000)
+API_BASE_URL = os.environ.get("CREDIT_API_URL", "http://localhost:8000")
+
+def api_is_available() -> bool:
+    """Kiểm tra API server có đang chạy không"""
+    try:
+        r = requests.get(f"{API_BASE_URL}/health", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 # ==================== PAGE CONFIGURATION ====================
 st.set_page_config(
@@ -152,25 +165,44 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==================== LOAD ASSETS ====================
+import streamlit as st
+import os
+import joblib
+from utils import DataPreprocessor  # Import trực tiếp class từ utils
+
 @st.cache_resource
 def load_assets():
-    """Load model and preprocessor"""
+    """Load preprocessor từ utils và chuẩn bị model fallback"""
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    model_path = os.path.join(current_dir, '..', 'models', 'lgbm_best_model.pkl')
-    processor_path = os.path.join(current_dir, '..', 'models', 'data_preprocessor.pkl')
-    
+
     try:
-        model = joblib.load(model_path)
-        processor = joblib.load(processor_path)
-        processor.is_training = False
-        return model, processor
+        # Dùng is_training=True để datapreprocessing() tự build schema cột
+        # từ data người dùng upload, không cần train_features từ pkl.
+        # Việc align cột với model (reindex theo FEATURES) được xử lý bởi api.py,
+        # nên main.py không cần biết schema training.
+        processor = DataPreprocessor(is_training=True)
     except Exception as e:
-        st.error(f"❌ Lỗi tải mô hình: {e}")
+        st.error(f"❌ Lỗi khởi tạo preprocessor: {e}")
         st.stop()
+
+    # Nếu API không khả dụng → fallback load model local
+    if not api_is_available():  # Giả sử hàm này đã được định nghĩa ở đâu đó
+        st.warning("⚠️ API server không phản hồi — đang dùng model local làm dự phòng")
+        model_path = os.path.join(current_dir, '..', 'models', 'lgbm_best_model.pkl')
+        try:
+            model = joblib.load(model_path)
+        except Exception as e:
+            st.error(f"❌ Không thể load model local: {e}")
+            st.stop()
+        return model, processor
+
+    return None, processor  # model=None → sẽ dùng API
 
 @st.cache_resource
 def load_shap_explainer(_model):
-    """Initialize SHAP Explainer for LightGBM"""
+    """Khởi tạo SHAP explainer nếu có model local"""
+    if _model is None:
+        return None  # SHAP sẽ gọi qua API endpoint /shap
     try:
         return shap.TreeExplainer(_model)
     except Exception as e:
@@ -180,6 +212,7 @@ def load_shap_explainer(_model):
 # Load assets
 model, processor = load_assets()
 explainer = load_shap_explainer(model)
+USE_API = model is None  # True → dùng API, False → dùng model local
 
 # ==================== HELPER FUNCTIONS ====================
 def load_if_exists(file, file_name=""):
@@ -211,8 +244,39 @@ def load_if_exists(file, file_name=""):
 # FIX 1: Removed @st.cache_data — DataFrames are not reliably hashable by Streamlit.
 # Instead, predictions are computed once and stored in st.session_state.
 def get_prediction_results(processed_df, features):
-    """Get prediction probabilities"""
-    return model.predict_proba(processed_df[features])[:, 1]
+    """
+    Dự đoán xác suất rủi ro.
+    - Nếu USE_API=True  → gọi POST /predict trên API server
+    - Nếu USE_API=False → dùng model local (fallback)
+    """
+    if USE_API:
+        try:
+            records = processed_df[features].fillna(0).to_dict(orient="records")
+            response = requests.post(
+                f"{API_BASE_URL}/predict",
+                json={"records": records, "features": features},
+                timeout=60,
+            )
+            response.raise_for_status()
+            return np.array(response.json()["probabilities"])
+        except requests.exceptions.Timeout:
+            st.error("❌ API timeout — server xử lý quá lâu. Thử lại hoặc giảm số lượng khách hàng.")
+            st.stop()
+        except requests.exceptions.ConnectionError:
+            st.error(f"❌ Không kết nối được API tại {API_BASE_URL}. Kiểm tra server đang chạy chưa.")
+            st.stop()
+        except Exception as e:
+            st.error(f"❌ Lỗi gọi API: {str(e)}")
+            st.stop()
+    else:
+        # Fallback local: reindex về đúng thứ tự cột model đã train
+        # vì is_training=True nên processed_df có thể thiếu/thừa cột
+        try:
+            model_features = model.feature_name_
+        except AttributeError:
+            model_features = list(model.booster_.feature_name())
+        X = processed_df.reindex(columns=model_features, fill_value=0).fillna(0).astype(float)
+        return model.predict_proba(X)[:, 1]
 
 def get_risk_category(prob, threshold_low=0.2, threshold_high=0.5):
     """Categorize risk level with 3 categories"""
@@ -367,7 +431,7 @@ def generate_business_explanation(customer_data, probability, features):
     n_pos = len(explanation["positive_factors"])
     n_neg = len(explanation["negative_factors"])
 
-    if probability < 0.35:
+    if probability < 0.2:
         explanation["risk_assessment"] = (
             f"Khách hàng có hồ sơ tài chính tốt với {n_pos} yếu tố tích cực"
             + (f" và {n_neg} điểm cần lưu ý" if n_neg else "")
@@ -378,7 +442,7 @@ def generate_business_explanation(customer_data, probability, features):
             "💳 Hạn mức đề xuất phù hợp với thu nhập và nhu cầu thực tế",
             "📈 Xem xét nâng hạn mức trong kỳ đánh giá tiếp theo nếu thanh toán đúng hạn",
         ]
-    elif probability < 0.65:
+    elif probability < 0.5:
         explanation["risk_assessment"] = (
             f"Khách hàng có mức rủi ro trung bình ({n_pos} yếu tố tích cực, {n_neg} yếu tố tiêu cực). "
             "Cần thẩm định bổ sung trước khi quyết định."
@@ -449,6 +513,14 @@ st.markdown("""
 
 # ==================== SIDEBAR: FILE UPLOAD ====================
 st.sidebar.title("📁 Tải lên Dữ liệu")
+st.sidebar.markdown("---")
+
+# Hiển thị trạng thái API
+with st.sidebar:
+    if api_is_available():
+        st.success(f"🟢 API Online  \n`{API_BASE_URL}`")
+    else:
+        st.warning(f"🟡 API Offline — dùng model local  \n`{API_BASE_URL}`")
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Hướng dẫn:** Tải lên các file CSV của bạn. Chỉ cần file 'Application' là bắt buộc.")
 
@@ -677,33 +749,78 @@ if app_file is not None:
         with tab3:
             st.subheader("🔬 Phân Tích SHAP - Yếu Tố Kỹ Thuật")
             st.info("SHAP (SHapley Additive exPlanations) giải thích tác động của từng biến đến dự đoán")
-            
+
+            # Hiển thị nguồn đang dùng
+            if USE_API:
+                st.caption(f"🌐 Đang dùng API: `{API_BASE_URL}/shap`")
+            else:
+                st.caption("💻 Đang dùng model local")
+
             customer_id = st.selectbox(
                 "Chọn khách hàng:",
                 st.session_state.result_df['SK_ID_CURR'],
                 format_func=lambda x: f"ID: {x}",
                 key="shap_selectbox"
             )
-            
-            if customer_id and explainer is not None:
+
+            shap_available = USE_API or (explainer is not None)
+
+            if customer_id and shap_available:
                 mask = st.session_state.result_df['SK_ID_CURR'] == customer_id
                 row_pos = st.session_state.result_df.index[mask][0]
-                
+
                 with st.spinner("Đang tính toán SHAP values..."):
                     try:
                         X_customer = st.session_state.processed_df.iloc[[row_pos]][st.session_state.features]
                         X_customer_numeric = X_customer.fillna(0).astype(float)
-                        shap_values = explainer.shap_values(X_customer_numeric)
-                        
-                        fig = plot_shap_for_customer(shap_values, X_customer_numeric, st.session_state.features, max_features=10)
-                        if fig:
+
+                        if USE_API:
+                            # Gọi endpoint /shap trên API server
+                            record = X_customer_numeric.iloc[0].to_dict()
+                            response = requests.post(
+                                f"{API_BASE_URL}/shap",
+                                json={
+                                    "record": record,
+                                    "features": st.session_state.features,
+                                    "top_n": 10,
+                                },
+                                timeout=30,
+                            )
+                            response.raise_for_status()
+                            shap_data = response.json()
+
+                            # Vẽ từ dữ liệu API trả về
+                            fig, ax = plt.subplots(figsize=(10, 6))
+                            values = shap_data["shap_values"]
+                            names = shap_data["feature_names"]
+                            colors = ['#dc2626' if v > 0 else '#16a34a' for v in values]
+                            ax.barh(range(len(names)), values, color=colors)
+                            ax.set_yticks(range(len(names)))
+                            ax.set_yticklabels(names, fontsize=9)
+                            ax.set_xlabel("SHAP Value (Tác động đến xác suất rủi ro)", fontsize=10)
+                            ax.set_title("Top 10 Yếu tố Ảnh hưởng Nhất", fontsize=11, fontweight='bold')
+                            ax.invert_yaxis()
+                            plt.tight_layout()
                             st.pyplot(fig, use_container_width=True)
                         else:
-                            st.info("Không thể tạo biểu đồ SHAP cho khách hàng này.")
+                            # Dùng explainer local
+                            shap_values = explainer.shap_values(X_customer_numeric)
+                            fig = plot_shap_for_customer(
+                                shap_values, X_customer_numeric,
+                                st.session_state.features, max_features=10
+                            )
+                            if fig:
+                                st.pyplot(fig, use_container_width=True)
+                            else:
+                                st.info("Không thể tạo biểu đồ SHAP cho khách hàng này.")
+
+                    except requests.exceptions.RequestException as e:
+                        st.error(f"❌ Lỗi gọi API SHAP: {str(e)}")
                     except Exception as e:
                         st.error(f"Lỗi SHAP: {str(e)}")
-            elif not explainer:
-                st.warning("⚠️ SHAP Explainer không khả dụng")
+
+            elif not shap_available:
+                st.warning("⚠️ SHAP Explainer không khả dụng (API offline và không có model local)")
         
         with tab4:
             st.subheader("📥 Tải Xuống Kết Quả")

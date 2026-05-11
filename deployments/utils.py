@@ -339,7 +339,13 @@ class DataPreprocessor:
             self.train_features = [c for c in df.columns if c != 'TARGET']
         else:
             if self.train_features is None:
-                raise ValueError("Train first")
+                # Không có pkl → không thể align cột với model.
+                # Ném lỗi rõ ràng hơn để dễ debug.
+                raise ValueError(
+                    "processor.train_features chưa được set. "
+                    "Cần load train_features từ data_preprocessor.pkl trước khi gọi datapreprocessing() "
+                    "ở chế độ inference (is_training=False)."
+                )
             
             missing_cols = set(self.train_features) - set(df.columns)
             for c in missing_cols:
